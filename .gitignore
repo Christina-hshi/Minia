@@ -1,3 +1,5 @@
-./build
-./test*
-./debug
+build*
+test*
+debug
+thirdparty
+thirdparty/gatb-core
