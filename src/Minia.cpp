@@ -64,7 +64,8 @@ Minia::Minia () : Tool ("minia")
 	assemblyParser->push_front (new OptionOneParam (STR_FASTA_LINE_SIZE, "number of nucleotides per line in fasta output (0 means one line)",  false, "0"));
 	assemblyParser->push_front (new OptionOneParam (STR_TRAVERSAL_KIND,  "traversal type ('contig', 'unitig')", false,  "contig"  ));
 	assemblyParser->push_front (new OptionNoParam  (STR_KEEP_ISOLATED,   "keep short (<= max(2k, 150 bp)) isolated output sequences", false));
-	assemblyParser->push_front (new OptionOneParam (STR_URI_INPUT,       "input reads (fasta/fastq/compressed) or hdf5 file",   false));
+	assemblyParser->push_front (new OptionNoParam ("-unitig","input is 'unitig'", false)); //By Christina
+    assemblyParser->push_front (new OptionOneParam (STR_URI_INPUT,       "input reads (fasta/fastq/compressed) or hdf5 file",   false));
 
     getParser()->push_back (assemblyParser);
 
@@ -125,41 +126,42 @@ struct Parameter
 };
 
 template<size_t span> 
-struct MiniaFunctor  {  void operator ()  (Parameter parameter)
-{
-    Minia&       minia = parameter.minia;
+struct MiniaFunctor  {  
+    void operator ()  (Parameter parameter){
+        Minia&       minia = parameter.minia;
 
-    // selection of type of graph is done HERE
-    //typedef GraphTemplate<NodeFast<span>,EdgeFast<span>,GraphDataVariantFast<span>> GraphType;
-    typedef GraphUnitigsTemplate<span> GraphType;
-    
-    GraphType graph;
-    
-    {
-        TIME_INFO (minia.getTimeInfo(), "graph construction");
+        // selection of type of graph is done HERE
+        //typedef GraphTemplate<NodeFast<span>,EdgeFast<span>,GraphDataVariantFast<span>> GraphType;
+        typedef GraphUnitigsTemplate<span> GraphType;
+        
+        GraphType graph;
+        
+        {
+            TIME_INFO (minia.getTimeInfo(), "graph construction");
 
-        if (minia.getInput()->get(STR_URI_INPUT) != 0)
-        {
-            graph = GraphType::create (minia.getInput());
+            if (minia.getInput()->get(STR_URI_INPUT) != 0){ 
+                if(minia.getInput()->get("-unitig")){
+                    graph = GraphType::loadUnitig(minia.getInput()->getStr(STR_URI_INPUT), minia.getInput()); //added by Christina
+                }else{
+                    graph = GraphType::create (minia.getInput()); //minia.getInput() return "IProperties*    
+                }
+            }else{
+                throw OptionFailure (minia.getParser(), "Specifiy -in");
+            }
         }
-        else
-        {
-            throw OptionFailure (minia.getParser(), "Specifiy -in");
-        }
+
+        /** We build the contigs. */
+        string output = minia.assemble<GraphType, NodeGU, EdgeGU, span>(graph);
+
+        // link contigs
+        uint nb_threads = 1;  // doesn't matter because for now link_tigs is single-threaded
+        bool verbose = true;
+        link_tigs<span>(output, minia.k, nb_threads, minia.nbContigs, verbose);
+
+
+        /** We gather some statistics. */
+        minia.getInfo()->add (1, minia.getTimeInfo().getProperties("time"));
     }
-
-    /** We build the contigs. */
-    string output = minia.assemble<GraphType, NodeGU, EdgeGU, span>(graph);
-
-    // link contigs
-    uint nb_threads = 1;  // doesn't matter because for now link_tigs is single-threaded
-    bool verbose = true;
-    link_tigs<span>(output, minia.k, nb_threads, minia.nbContigs, verbose);
-
-
-    /** We gather some statistics. */
-    minia.getInfo()->add (1, minia.getTimeInfo().getProperties("time"));
-}
 };
 
 void Minia::execute ()
@@ -176,10 +178,15 @@ template <typename Graph_type, typename Node, typename Edge, size_t span>
 void Minia::assembleFrom(Node startingNode, Graph_type& graph, IBank *outputBank)
 {
     unsigned int isolatedCutoff = std::max(2*(unsigned int)graph.getKmerSize(), (unsigned int)150);
+    //isolatedCutoff=0;//removed Remember Christina
 
     bool isolatedLeft, isolatedRight;
     float coverage = 0;
+    //std::cout<<"\n[Christina]\tisolated cutoff "<<isolatedCutoff<<endl;
+
     string sequence = graph.simplePathBothDirections(startingNode, isolatedLeft, isolatedRight, true, coverage);
+
+    //std::cout<<"\n[Christina]\t"<<sequence<<endl;
 
     Sequence seq (Data::ASCII);
     seq.getData().setRef ((char*)sequence.c_str(), sequence.size());
@@ -188,8 +195,10 @@ void Minia::assembleFrom(Node startingNode, Graph_type& graph, IBank *outputBank
     // spades-like header (compatible with bandage) 
     //ss1 << "NODE_"<< nbContigs + 1 << "_length_" << sequence.size() << "_cov_" << fixed << std::setprecision(3) << coverage << "_ID_" << nbContigs;
     // bcalm-like header (that can be converted to GFA)
+    //ss1 << nbContigs  << " LN:i:" << sequence.size() << " KC:i:" << (unsigned int)(coverage*(sequence.size()-k+1)) << " km:f:" << fixed << std::setprecision(3) << coverage ;
+    //consider change to "KM" in order to be consistent with description in github
     ss1 << nbContigs  << " LN:i:" << sequence.size() << " KC:i:" << (unsigned int)(coverage*(sequence.size()-k+1)) << " km:f:" << fixed << std::setprecision(3) << coverage ;
-   
+
     seq._comment = ss1.str();
     unsigned int lenTotal = sequence.size();
     if (lenTotal > isolatedCutoff || (lenTotal <= isolatedCutoff && (!(isolatedLeft && isolatedRight))) || keepIsolatedTigs)
@@ -199,8 +208,11 @@ void Minia::assembleFrom(Node startingNode, Graph_type& graph, IBank *outputBank
         totalNt   += lenTotal;
         if (lenTotal > maxContigLen)      { maxContigLen      = lenTotal;   }
     }
-    else
+    else{
         nbSmallContigs++;
+        //cout<<"[Christina]\tcontig being too small to output"<<endl;
+    }
+
     return;
 }
 
@@ -290,6 +302,7 @@ string Minia::assemble (/*const, removed because Simplifications isn't const any
     }
 
     //graph.debugPrintAllUnitigs(); // debugging
+    std::cout<<"[Christina]\toutput unipaths after simplication...."<<endl;
 
     /** We loop over all nodes. */
     for (itNode.first(); !itNode.isDone(); itNode.next())
@@ -301,6 +314,7 @@ string Minia::assemble (/*const, removed because Simplifications isn't const any
 
         DEBUG ((cout << endl << "-------------------------- " << graph.toString (node) << " -------------------------" << endl));
 
+        //std::cout<<"\n[Christina]\tassembleFrom ...."<<endl;
         assembleFrom<Graph_type, Node, Edge, span>(node, graph, outputBank);
     }
     
